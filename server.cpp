@@ -19,6 +19,7 @@ Server::Server() : QTcpServer(nullptr)
     settings.beginGroup("Connection");
     listen(QHostAddress(settings.value("address").toString()), settings.value("port").toInt());
     settings.endGroup();
+
     qDebug() << "started on " << this->serverAddress();
     qDebug() << "started on " << this->serverPort();
 }

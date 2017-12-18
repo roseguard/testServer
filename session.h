@@ -31,7 +31,8 @@ class Session : public QThread
 public:
     Session(int SessionSocketDesc, QObject * parent = 0);
     ~Session();
-    void requestHandling(QTcpSocket &socket, QByteArray request);
+    QByteArray getUserName();
+    void requestHandling(QTcpSocket &socket);
     void commandHandling(QTcpSocket &socket, QByteArray command);
 
     void addMessage(QByteArray newMessage);
@@ -46,9 +47,9 @@ public:
 private:
     int             sockDesc;
     bool       hasDbAcces = false;
-    QByteArray login;
+    QByteArray login = "noname";
     QList<QByteArray> toSend;
-    QList<QByteArray*> loginsList;
+    QList<QByteArray> commandsReply;
     static QList<Session*> sessions;
 signals:
     void sessionDead(Session*);

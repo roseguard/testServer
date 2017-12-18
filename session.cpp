@@ -6,6 +6,8 @@
 #include <QSqlError>
 #include <QBuffer>
 
+#define __DEBUG
+
 QList<Session*> Session::sessions;
 
 Session::Session(int SessionSocketDesc, QObject *parent) : QThread(parent)
@@ -19,6 +21,11 @@ Session::Session(int SessionSocketDesc, QObject *parent) : QThread(parent)
 Session::~Session()
 {
     sessions.removeOne(this); // убираем из списка когда поток закончился
+}
+
+QByteArray Session::getUserName()
+{
+    return login;
 }
 
 void Session::run()
@@ -47,7 +54,8 @@ void Session::run()
         {
             while(socket.bytesAvailable()>0)    // если пришли данные то считываем их и передаем на обработку
             {
-                requestHandling(socket, socket.readAll());
+//                qDebug() << socket.readLine();
+                requestHandling(socket);
             }
         }
         if(socket.state()==QAbstractSocket::UnconnectedState)
@@ -58,26 +66,42 @@ void Session::run()
     }
 }
 
-void Session::requestHandling(QTcpSocket &socket, QByteArray request)
+void Session::requestHandling(QTcpSocket &socket)
 {
-    qDebug() << request;
-
-    QList<QByteArray> list = request.split('\n');   // разделяем строки запроса для их отдельной обработки
-    int i =  0;
-    for(; i < list.length(); i++)   // ищем начало xml
+    QMap<QByteArray, QByteArray> httpRequestParams;
+    int packetSize = 0;
+    while(socket.bytesAvailable())     // парсим параметры запроса
     {
-       if(!list.at(i).isEmpty() && list.at(i).at(0)=='<')
-           break;
+        QByteArray tempLine = socket.readLine();
+        if(tempLine=="\r\n")   // конец параметрам запроса
+            break;
+        QList<QByteArray> tempHttpParamList = QString(tempLine).remove('\r').remove('\n').toUtf8().split(':');
+        httpRequestParams[tempHttpParamList.first()] = tempHttpParamList.last();
     }
-    if(i==list.length())
+    packetSize = httpRequestParams["Content-Length"].toInt();
+
+    if(packetSize==0) // если запрос не передал размер данных
         return;
-    QByteArray xmlArray = list.at(i++);   // на случай если xml раздробился - соединяем
-    for(; i < list.length(); i++)
-        xmlArray.append("\n"+list.at(i));
+
+    QByteArray xmlArray;
+    while(xmlArray.length() < packetSize)
+    {
+        if(socket.bytesAvailable()>0)
+        {
+            xmlArray.append(socket.read(packetSize-xmlArray.length()));
+        }
+        else
+        {
+            socket.waitForReadyRead();
+        }
+    }
+
+#ifdef __DEBUG
     QFile file(QCoreApplication::applicationDirPath()+"/xml.xml");
     file.open(QIODevice::WriteOnly);
     file.write(xmlArray);
     file.close();
+#endif
 
     QBuffer buff(&xmlArray);        // создаем буфер для работы с xml reader
     buff.open(QIODevice::ReadOnly);
@@ -89,10 +113,29 @@ void Session::requestHandling(QTcpSocket &socket, QByteArray request)
     while(!reader.atEnd()) // обрабатываем xml
     {
         reader.readNext();
+#ifdef __DEBUG
         qDebug() << reader.name();
+#endif
         if(reader.name()=="Login")
         {
-            login = reader.readElementText().toUtf8();
+            QByteArray tempLogin = reader.readElementText().toUtf8();
+            bool loginCollision = false;
+            for(int i = 0; i < sessions.length(); i++)
+            {
+                if(sessions.at(i)->getUserName()==tempLogin)
+                {
+                    loginCollision = true;
+                    break;
+                }
+            }
+            if(!loginCollision)
+            {
+                login = tempLogin;
+            }
+            else
+            {
+                commandsReply.append("User exists");
+            }
         }
         if(reader.name()=="Message")
         {
@@ -103,14 +146,14 @@ void Session::requestHandling(QTcpSocket &socket, QByteArray request)
             commands.append(reader.readElementText().toUtf8());
         }
     }
+
     broadcastMessages(login, messages); // сообщаем всем пользователям на сервере о новых сообщениях
+
+    qDebug() << "commands " << commands.length();
     for(int i = 0; i < commands.length(); i++)
     {
         commandHandling(socket, commands.at(i));
     }
-
-//    sendMessage(socket, mess);
-//    socket.waitForBytesWritten();
 }
 
 void Session::commandHandling(QTcpSocket &socket, QByteArray command)
@@ -142,13 +185,25 @@ void Session::sendMessage(QTcpSocket &socket, QByteArray message)
 void Session::broadcastMessages(QByteArray fromUser, QList<QByteArray> messages)
 {
     QByteArray xmlArrayPart;
-    for(int i = 0; i < messages.length(); i++)
+    if(messages.length()>0)
     {
-        xmlArrayPart.append("<MESSAGE>");
-        xmlArrayPart.append("<Login>"+fromUser+"</Login>");
-        xmlArrayPart.append("<Message>"+messages.at(i)+"</Message>");
-        xmlArrayPart.append("</MESSAGE>");
-        writeToDb(fromUser, messages.at(i));
+        xmlArrayPart.append("<REPLY>");
+        for(int i = 0; i < messages.length(); i++)
+        {
+            xmlArrayPart.append("<MESSAGE>");
+            xmlArrayPart.append("<Login>"+fromUser+"</Login>");
+            xmlArrayPart.append("<Message>"+messages.at(i)+"</Message>");
+            xmlArrayPart.append("</MESSAGE>");
+            writeToDb(fromUser, messages.at(i));
+        }
+        for(int i = 0; i < commandsReply.length(); i++)
+        {
+            xmlArrayPart.append("<COMMAND>");
+            xmlArrayPart.append("<Command>" + commandsReply.at(i) + "</Command>");
+            xmlArrayPart.append("</COMMAND>");
+        }
+        commandsReply.clear();
+        xmlArrayPart.append("</REPLY>");
     }
     if(xmlArrayPart.isEmpty())
         return;
@@ -168,7 +223,9 @@ void Session::writeToDb(QByteArray login, QByteArray message)
     db.open();
     QSqlQuery    query(db);
     query.exec("INSERT INTO chat(login, message) VALUES('"+login+"','"+message+"');");
+#ifdef __DEBUG
     qDebug() << query.lastQuery() + " : " << query.lastError();
+#endif
 
     DatabaseQueue::sessionWasFinished(this);
 }
@@ -176,14 +233,28 @@ void Session::writeToDb(QByteArray login, QByteArray message)
 QByteArray Session::getLastMessageXml(int count)
 {
     DatabaseQueue::addSession(this);
-    while(!hasDbAcces);
+    while(!hasDbAcces)
+        QThread::currentThread()->msleep(10);
 
     QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", QByteArray::number(sockDesc));
     db.setDatabaseName("chat.db");
     db.open();
     QSqlQuery    query(db);
     query.exec("SELECT * FROM chat ORDER BY id DESC LIMIT +"+QByteArray::number(count)+";");
+#ifdef __DEBUG
     qDebug() << query.lastQuery() + " : " << query.lastError();
+#endif
+
+    QList<QString> logins;
+    QList<QString> messages;
+    while(query.next())
+    {
+        logins.append(query.value("login").toString());
+        messages.append(query.value("message").toString());
+    }
+
+    DatabaseQueue::sessionWasFinished(this);
+
 
     QByteArray replyArray;
     QBuffer buff(&replyArray);
@@ -192,19 +263,29 @@ QByteArray Session::getLastMessageXml(int count)
     QXmlStreamWriter writer(&buff);
     writer.writeStartDocument();
     writer.writeStartElement("REPLY");
-    writer.writeStartElement("MESSAGES");
 
-    while(query.next())
+
+    writer.writeStartElement("MESSAGES");
+    for(int i = logins.length()-1; i >= 0; i--)
     {
-            writer.writeStartElement("MESSAGE");
-            writer.writeTextElement("LOGIN", query.value("login").toString());
-            writer.writeTextElement("Message", query.value("message").toString());
-            writer.writeEndElement();
+        writer.writeStartElement("MESSAGE");
+        writer.writeTextElement("Login", logins.at(i));
+        writer.writeTextElement("Message", messages.at(i));
+        writer.writeEndElement();
     }
+    writer.writeEndElement();
+
+    writer.writeStartElement("COMMAND");
+    for(int i = 0; i < commandsReply.length(); i++)
+    {
+        writer.writeTextElement("Command", commandsReply.at(i));
+    }
+    commandsReply.clear();
+    writer.writeEndElement();
+
     writer.writeEndElement();
     writer.writeEndDocument();
 
-    DatabaseQueue::sessionWasFinished(this);
     return replyArray;
 }
 
